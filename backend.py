@@ -167,6 +167,18 @@ class ResourceBackend:
         raise NotImplementedError()
 
 
+class LocalFileSystemModel(QFileSystemModel):
+    def headerData(self, section, orientation, role=0):
+        if (
+            orientation == Qt.Orientation.Horizontal
+            and role == Qt.ItemDataRole.DisplayRole
+        ):
+            labels = ["名称", "大小", "类型", "修改时间"]
+            if section < len(labels):
+                return labels[section]
+        return super().headerData(section, orientation, role)
+
+
 class LocalResourceBackend(ResourceBackend):
     def __init__(self, start_path: str | None = None):
         self._start_path = start_path or QDir.homePath()
@@ -178,7 +190,7 @@ class LocalResourceBackend(ResourceBackend):
         return self._start_path
 
     def create_model(self, parent):
-        model = QFileSystemModel(parent)
+        model = LocalFileSystemModel(parent)
         model.setRootPath(self._start_path)
         return model
 
