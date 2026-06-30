@@ -1,13 +1,15 @@
 import sys
+import tempfile
 from pathlib import Path
-from shutil import copy2, copytree, rmtree
 
-from PySide6.QtCore import QDir, Qt, QUrl
-from PySide6.QtGui import QAction, QDesktopServices
+import shutil
+
+from PySide6.QtCore import QDir, Qt
+from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (
-    QApplication,
     QAbstractItemView,
-    QFileSystemModel,
+    QApplication,
+    QDialog,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -20,121 +22,20 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from backend import (
+    LocalResourceBackend,
+    ResourceBackend,
+    SshConnectDialog,
+    SshResourceBackend,
+)
+
 
 WINDOWS = []
 
 
-def copy_path(source_path, target_path):
-    source = Path(source_path)
-    destination = Path(target_path) / source.name
-    if source == destination:
-        return
-    if source.is_dir():
-        copytree(source, destination, dirs_exist_ok=True)
-        return
-    copy2(source, destination)
-
-
-class ResourceBackend:
-    def resource_type(self):
-        raise NotImplementedError()
-
-    def start_path(self):
-        raise NotImplementedError()
-
-    def create_model(self, parent):
-        raise NotImplementedError()
-
-    def index_for_path(self, model, path):
-        raise NotImplementedError()
-
-    def path_for_index(self, model, index):
-        raise NotImplementedError()
-
-    def is_dir(self, model, index):
-        raise NotImplementedError()
-
-    def path_exists(self, model, path):
-        raise NotImplementedError()
-
-    def selected_paths(self, model, selection_model):
-        raise NotImplementedError()
-
-    def display_name(self, path):
-        raise NotImplementedError()
-
-    def begin_rename(self, tree, index):
-        raise NotImplementedError()
-
-    def receive_paths(self, source_paths, target_path):
-        raise NotImplementedError()
-
-    def delete_paths(self, paths):
-        raise NotImplementedError()
-
-    def parent_path(self, path):
-        raise NotImplementedError()
-
-    def open_path(self, path):
-        raise NotImplementedError()
-
-
-class LocalResourceBackend(ResourceBackend):
-    def __init__(self, start_path: str | None = None):
-        self._start_path = start_path or QDir.homePath()
-
-    def resource_type(self):
-        return "本地"
-
-    def start_path(self):
-        return self._start_path
-
-    def create_model(self, parent):
-        model = QFileSystemModel(parent)
-        model.setRootPath(self._start_path)
-        return model
-
-    def index_for_path(self, model, path):
-        return model.index(path)
-
-    def path_for_index(self, model, index):
-        return model.filePath(index)
-
-    def is_dir(self, model, index):
-        return model.isDir(index)
-
-    def path_exists(self, model, path):
-        return self.index_for_path(model, path).isValid()
-
-    def selected_paths(self, model, selection_model):
-        return [model.filePath(index) for index in selection_model.selectedRows()]
-
-    def display_name(self, path):
-        return Path(path).name or path
-
-    def begin_rename(self, tree, index):
-        tree.edit(index)
-
-    def receive_paths(self, source_paths, target_path):
-        for path in source_paths:
-            copy_path(path, target_path)
-
-    def delete_paths(self, paths):
-        for path in paths:
-            item = Path(path)
-            if item.is_dir():
-                rmtree(item)
-                continue
-            item.unlink()
-
-    def parent_path(self, path):
-        return str(Path(path).parent)
-
-    def open_path(self, path):
-        QDesktopServices.openUrl(QUrl.fromLocalFile(path))
-
-
 class ResourceTreeView(QTreeView):
+    _drag_source_owner = None
+
     def __init__(self, owner: "ResourcePane"):
         super().__init__()
         self.owner = owner
@@ -149,33 +50,40 @@ class ResourceTreeView(QTreeView):
         self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.customContextMenuRequested.connect(self.show_context_menu)
 
+    def startDrag(self, supportedActions):
+        ResourceTreeView._drag_source_owner = self.owner
+        try:
+            super().startDrag(supportedActions)
+        finally:
+            ResourceTreeView._drag_source_owner = None
+
     def dragEnterEvent(self, event):
-        if event.mimeData().hasUrls():
-            event.acceptProposedAction()
-            return
-        super().dragEnterEvent(event)
+        event.acceptProposedAction()
 
     def dragMoveEvent(self, event):
-        if event.mimeData().hasUrls():
-            event.acceptProposedAction()
-            return
-        super().dragMoveEvent(event)
+        event.acceptProposedAction()
 
     def dropEvent(self, event):
-        if not event.mimeData().hasUrls():
-            super().dropEvent(event)
-            return
-
         target_path = self.owner.current_path()
         index = self.indexAt(event.position().toPoint())
         if index.isValid() and self.owner.is_dir(index):
             target_path = self.owner.path_from_index(index)
 
-        self.owner.receive_paths(
-            [url.toLocalFile() for url in event.mimeData().urls()],
-            target_path,
-        )
-        event.acceptProposedAction()
+        if event.mimeData().hasUrls():
+            self.owner.receive_paths(
+                [url.toLocalFile() for url in event.mimeData().urls()],
+                target_path,
+            )
+            event.acceptProposedAction()
+            return
+
+        source = ResourceTreeView._drag_source_owner
+        if source is not None and source is not self.owner:
+            source.host.copy_between(source, self.owner)
+            event.acceptProposedAction()
+            return
+
+        super().dropEvent(event)
 
     def show_context_menu(self, position):
         index = self.indexAt(position)
@@ -293,6 +201,15 @@ class ResourcePane(QWidget):
         self.tree.setRootIndex(index)
         self.path_edit.setText(path)
 
+    def set_backend(self, title, backend):
+        self.title_label.setText(title)
+        self.type_label.setText(backend.resource_type())
+        self.backend = backend
+        self.model = backend.create_model(self)
+        self.tree.setModel(self.model)
+        root_path = backend.start_path()
+        self.set_current_path(root_path)
+
     def path_from_index(self, index):
         return self.backend.path_for_index(self.model, index)
 
@@ -382,6 +299,17 @@ class MainWindow(QMainWindow):
         new_window_action = file_menu.addAction("新建窗口")
         new_window_action.triggered.connect(self.open_new_window)
 
+        ssh_action = file_menu.addAction("SSH 连接...")
+        ssh_action.triggered.connect(self.open_ssh_connection)
+
+    def open_ssh_connection(self):
+        dialog = SshConnectDialog(self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        info = dialog.connection_info()
+        backend = SshResourceBackend(**info)
+        self.right_pane.set_backend("右侧", backend)
+
     def open_new_window(self):
         window = MainWindow(self.left_pane.current_path() or QDir.homePath())
         window.show()
@@ -399,7 +327,22 @@ class MainWindow(QMainWindow):
             return
 
         target = target_pane or self.other_pane(source_pane)
-        target.receive_paths(selected_paths)
+        source_backend = source_pane.backend
+
+        if isinstance(source_backend, LocalResourceBackend):
+            target.receive_paths(selected_paths)
+            return
+
+        temp_dir = Path(tempfile.mkdtemp())
+        try:
+            local_paths = []
+            for path in selected_paths:
+                local_path = temp_dir / source_backend.display_name(path)
+                source_backend.export_path(path, str(local_path))
+                local_paths.append(str(local_path))
+            target.receive_paths(local_paths)
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
 
 
 def main():
