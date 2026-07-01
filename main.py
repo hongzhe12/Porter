@@ -23,10 +23,14 @@ from PySide6.QtWidgets import (
 )
 
 from backend import (
+    ContainerSelectDialog,
     LocalResourceBackend,
     ResourceBackend,
     SshConnectDialog,
+    SshDockerResourceBackend,
     SshResourceBackend,
+    load_session,
+    save_session,
 )
 
 
@@ -116,6 +120,21 @@ class ResourceTreeView(QTreeView):
         refresh_action.triggered.connect(self.owner.refresh)
         menu.addAction(refresh_action)
 
+        # SSH / Container-specific actions
+        backend = self.owner.backend
+        if isinstance(backend, SshResourceBackend) and not isinstance(
+            backend, SshDockerResourceBackend
+        ):
+            menu.addSeparator()
+            container_action = QAction("浏览容器...", self)
+            container_action.triggered.connect(self.owner.browse_containers)
+            menu.addAction(container_action)
+        elif isinstance(backend, SshDockerResourceBackend):
+            menu.addSeparator()
+            exit_action = QAction("退出容器", self)
+            exit_action.triggered.connect(self.owner.exit_container)
+            menu.addAction(exit_action)
+
         if not index.isValid():
             open_action.setEnabled(False)
             rename_action.setEnabled(False)
@@ -131,8 +150,9 @@ class ResourcePane(QWidget):
         super().__init__()
         self.host = host
         self.backend = backend
+        self._current_path = self.backend.start_path()
 
-        root_path = self.backend.start_path()
+        root_path = self._current_path
 
         self.title_label = QLabel(title)
         self.type_label = QLabel(self.backend.resource_type())
@@ -173,8 +193,8 @@ class ResourcePane(QWidget):
         return f"{self.title_label.text()} {self.type_label.text()}"
 
     def go_up(self):
-        parent = self.backend.parent_path(self.current_path())
-        if parent and parent != self.current_path():
+        parent = self.backend.parent_path(self._current_path)
+        if parent and parent != self._current_path:
             self.set_current_path(parent)
 
     def open_path(self):
@@ -194,9 +214,10 @@ class ResourcePane(QWidget):
         self.backend.open_path(path)
 
     def current_path(self):
-        return self.path_from_index(self.tree.rootIndex())
+        return self._current_path
 
     def set_current_path(self, path):
+        self._current_path = path
         index = self.backend.index_for_path(self.model, path)
         self.tree.setRootIndex(index)
         self.path_edit.setText(path)
@@ -217,10 +238,11 @@ class ResourcePane(QWidget):
         return self.backend.is_dir(self.model, index)
 
     def selected_paths(self):
-        return self.backend.selected_paths(
+        paths = self.backend.selected_paths(
             self.model,
             self.tree.selectionModel(),
         )
+        return paths
 
     def receive_paths(self, source_paths, target_path=None):
         destination = target_path or self.current_path()
@@ -270,6 +292,57 @@ class ResourcePane(QWidget):
     def refresh(self):
         self.set_current_path(self.current_path())
 
+    def browse_containers(self):
+        if not isinstance(self.backend, SshResourceBackend):
+            return
+        dialog = ContainerSelectDialog(self.host, self.backend)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        info = dialog.container_info
+        ssh_host = self.backend._host
+        ssh_port = self.backend._port
+        ssh_user = self.backend._username
+        ssh_pw = self.backend._password
+        docker_backend = SshDockerResourceBackend(
+            client=self.backend.ssh_client,
+            container_id=info["container_id"],
+            container_name=info["container_name"],
+            ssh_host=ssh_host,
+            ssh_port=ssh_port,
+            ssh_username=ssh_user,
+            ssh_password=ssh_pw,
+        )
+        self.set_backend(self.title_label.text(), docker_backend)
+        save_session({
+            "right": {
+                "type": "docker",
+                "container_id": info["container_id"],
+                "container_name": info["container_name"],
+                "ssh_host": ssh_host,
+                "ssh_port": ssh_port,
+                "ssh_username": ssh_user,
+                "ssh_password": ssh_pw,
+            }
+        })
+
+    def exit_container(self):
+        if not isinstance(self.backend, SshDockerResourceBackend):
+            return
+        answer = QMessageBox.question(
+            self,
+            "退出容器",
+            "确认退出容器浏览，回到 SSH 浏览模式？",
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        host = self.backend._ssh_host
+        port = self.backend._ssh_port
+        user = self.backend._ssh_username
+        pw = self.backend._ssh_password
+        ssh_backend = SshResourceBackend(host, port, user, pw)
+        self.set_backend(self.title_label.text(), ssh_backend)
+        save_session({"right": {"type": "ssh", "host": host, "port": port, "username": user, "password": pw}})
+
 
 class MainWindow(QMainWindow):
     def __init__(self, start_path: str | None = None):
@@ -302,6 +375,36 @@ class MainWindow(QMainWindow):
         ssh_action = file_menu.addAction("SSH 连接...")
         ssh_action.triggered.connect(self.open_ssh_connection)
 
+        self._restore_session()
+
+    def _restore_session(self):
+        s = load_session()
+        right = s.get("right", {})
+        if not right:
+            return
+        t = right.get("type")
+        if t == "ssh":
+            try:
+                backend = SshResourceBackend(right["host"], right["port"], right["username"], right["password"])
+                self.right_pane.set_backend("右侧", backend)
+            except Exception:
+                pass
+        elif t == "docker":
+            try:
+                ssh = SshResourceBackend(right["ssh_host"], right["ssh_port"], right["ssh_username"], right["ssh_password"])
+                backend = SshDockerResourceBackend(
+                    client=ssh.ssh_client,
+                    container_id=right["container_id"],
+                    container_name=right["container_name"],
+                    ssh_host=right["ssh_host"],
+                    ssh_port=right["ssh_port"],
+                    ssh_username=right["ssh_username"],
+                    ssh_password=right["ssh_password"],
+                )
+                self.right_pane.set_backend("右侧", backend)
+            except Exception:
+                pass
+
     def open_ssh_connection(self):
         dialog = SshConnectDialog(self)
         if dialog.exec() != QDialog.DialogCode.Accepted:
@@ -309,6 +412,7 @@ class MainWindow(QMainWindow):
         info = dialog.connection_info()
         backend = SshResourceBackend(**info)
         self.right_pane.set_backend("右侧", backend)
+        save_session({"right": {"type": "ssh", **info}})
 
     def open_new_window(self):
         window = MainWindow(self.left_pane.current_path() or QDir.homePath())
@@ -328,11 +432,24 @@ class MainWindow(QMainWindow):
 
         target = target_pane or self.other_pane(source_pane)
         source_backend = source_pane.backend
+        target_backend = target.backend
 
+        # Fast path: Local -> Any
         if isinstance(source_backend, LocalResourceBackend):
             target.receive_paths(selected_paths)
             return
 
+        # Fast path: SshDocker -> Local (export via SSH channel)
+        if isinstance(source_backend, SshDockerResourceBackend) and isinstance(
+            target_backend, LocalResourceBackend
+        ):
+            target_path = target.current_path()
+            for path in selected_paths:
+                source_backend.export_path(path, str(target_path))
+            target.set_current_path(target.current_path())  # refresh
+            return
+
+        # Slow path: export to temp dir, then receive
         temp_dir = Path(tempfile.mkdtemp())
         try:
             local_paths = []
