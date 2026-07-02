@@ -1,6 +1,7 @@
 import sys
 import tempfile
 from pathlib import Path
+from typing import Optional
 
 import shutil
 
@@ -345,7 +346,7 @@ class ResourcePane(QWidget):
 
 
 class MainWindow(QMainWindow):
-    def __init__(self, start_path: str | None = None):
+    def __init__(self, start_path: Optional[str] = None):
         super().__init__()
         self.setWindowTitle("Porter")
         self.resize(1280, 720)

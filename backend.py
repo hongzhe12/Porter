@@ -7,6 +7,7 @@ import tempfile
 import time
 from datetime import datetime
 from pathlib import Path
+from typing import Optional
 from shutil import copy2, copytree, rmtree
 
 import paramiko
@@ -201,7 +202,7 @@ class LocalFileSystemModel(QFileSystemModel):
 
 
 class LocalResourceBackend(ResourceBackend):
-    def __init__(self, start_path: str | None = None):
+    def __init__(self, start_path: Optional[str] = None):
         self._start_path = start_path or QDir.homePath()
 
     def resource_type(self):
