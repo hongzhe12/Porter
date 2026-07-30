@@ -100,18 +100,16 @@ class ContainerPane(QWidget):
         self.backend = backend
         self._current_path = backend.start_path()
         self.model = backend.create_model(self)
+        self.setAcceptDrops(True)
 
         self.type_label = QLabel(backend.resource_type())
 
         self.path_edit = QLineEdit(self._current_path)
         self.open_button = QPushButton("打开")
         self.open_button.clicked.connect(self.open_path)
-        self.up_button = QPushButton("↑")
-        self.up_button.clicked.connect(self.go_up)
 
         top_bar = QHBoxLayout()
         top_bar.addWidget(self.path_edit)
-        top_bar.addWidget(self.up_button)
         top_bar.addWidget(self.open_button)
 
         self._search_results = False
@@ -146,13 +144,15 @@ class ContainerPane(QWidget):
         body.addWidget(self.tree)
         self.setLayout(body)
 
-    def go_up(self):
-        if self._search_results:
-            self.set_current_path(self._current_path)
-            return
-        parent = self.backend.parent_path(self._current_path)
-        if parent and parent != self._current_path:
-            self.set_current_path(parent)
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+
+    def dropEvent(self, event):
+        paths = [u.toLocalFile() for u in event.mimeData().urls() if u.isLocalFile()]
+        if paths:
+            self.backend.receive_paths(paths, self._current_path)
+            self.refresh()
 
     def open_path(self):
         path = self.path_edit.text().strip()
