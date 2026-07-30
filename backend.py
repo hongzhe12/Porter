@@ -295,6 +295,35 @@ class SshDockerResourceBackend:
         )
         return rc == 0
 
+    def search(self, path, keyword):
+        if not keyword:
+            return []
+        rc, stdout, _ = self._exec(
+            f"docker exec {self._container_id} find {shlex.quote(path)} -name '*{keyword}*' -maxdepth 5 2>/dev/null | head -200"
+        )
+        return stdout.splitlines() if rc == 0 else []
+
+    def search_index(self, model, path, keyword):
+        model.clear()
+        model.setHorizontalHeaderLabels(["匹配文件"])
+        for r in self.search(path, keyword):
+            item = QStandardItem(r)
+            item.setEditable(False)
+            item.setData(r, Qt.ItemDataRole.UserRole)
+            item.setData(False, Qt.ItemDataRole.UserRole + 1)
+            model.appendRow([item])
+        return QModelIndex()
+
+    def run_command(self, command, timeout=15):
+        rc, stdout, _ = self._exec(
+            f"docker exec {self._container_id} {command}", timeout
+        )
+        return rc, stdout
+
+    def extract_tar(self, path):
+        parent = path[:path.rfind("/")] if "/" in path else "/"
+        self._exec(f"docker exec {self._container_id} tar -xzf {shlex.quote(path)} -C {shlex.quote(parent)}")
+
     def selected_paths(self, model, selection_model):
         return [
             self.path_for_index(model, index)
