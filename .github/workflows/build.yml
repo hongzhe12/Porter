@@ -26,9 +26,8 @@ jobs:
       - run: |
           pyinstaller --onefile --windowed --icon icon.ico --name docker_editor main.py
 
-      - uses: softprops/action-gh-release@v2
+      - uses: actions/upload-artifact@v4
         with:
-          tag_name: build-${{ github.run_number }}
-          files: dist/docker_editor.exe
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          name: docker_editor
+          path: dist/docker_editor.exe
+          retention-days: 7
