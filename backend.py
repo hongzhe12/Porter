@@ -19,8 +19,12 @@ from PySide6.QtWidgets import (
     QFormLayout,
     QLabel,
     QLineEdit,
+    QListWidget,
+    QListWidgetItem,
     QMessageBox,
     QPushButton,
+    QVBoxLayout,
+    QWidget,
 )
 
 SESSION_FILE = Path.home() / ".porter" / "session.json"
@@ -78,6 +82,65 @@ class SshConnectDialog(QDialog):
         }
 
 
+class SearchableComboBox(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._items = []
+        self._selected_data = None
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        self._edit = QLineEdit()
+        self._edit.setPlaceholderText("输入搜索...")
+        layout.addWidget(self._edit)
+
+        self._list = QListWidget()
+        self._list.setMaximumHeight(200)
+        self._edit.textChanged.connect(self._filter)
+        self._list.itemClicked.connect(self._select_item)
+        layout.addWidget(self._list)
+
+    def addItem(self, text, userData=None):
+        self._items.append((text, userData))
+        item = QListWidgetItem(text)
+        item.setData(Qt.ItemDataRole.UserRole, userData)
+        self._list.addItem(item)
+
+    def clear(self):
+        self._items.clear()
+        self._list.clear()
+        self._selected_data = None
+
+    def lineEdit(self):
+        return self._edit
+
+    def currentData(self):
+        return self._selected_data
+
+    def currentText(self):
+        return self._edit.text()
+
+    def count(self):
+        return self._list.count()
+
+    def _filter(self, text):
+        self._list.clear()
+        for display, data in self._items:
+            if not text or text.lower() in display.lower():
+                item = QListWidgetItem(display)
+                item.setData(Qt.ItemDataRole.UserRole, data)
+                self._list.addItem(item)
+        self._list.setVisible(True)
+
+    def _select_item(self, item):
+        self._edit.setText(item.text())
+        self._selected_data = item.data(Qt.ItemDataRole.UserRole)
+
+    def mousePressEvent(self, event):
+        super().mousePressEvent(event)
+        self._filter(self._edit.text())
+
+
 class ContainerSelectDialog(QDialog):
     def __init__(self, parent, ssh_client, ssh_host=""):
         super().__init__(parent)
@@ -90,7 +153,10 @@ class ContainerSelectDialog(QDialog):
         if ssh_host:
             layout.addRow(QLabel(f"通过 SSH {ssh_host} 连接到 Docker"))
 
-        self.container_combo = QComboBox()
+        self.container_combo = SearchableComboBox()
+        self.container_combo.lineEdit().setPlaceholderText(
+            "输入 ID/镜像名/容器名 搜索..."
+        )
         layout.addRow("容器:", self.container_combo)
 
         self.refresh_btn = QPushButton("刷新")
@@ -321,8 +387,10 @@ class SshDockerResourceBackend:
         return rc, stdout
 
     def extract_tar(self, path):
-        parent = path[:path.rfind("/")] if "/" in path else "/"
-        self._exec(f"docker exec {self._container_id} tar -xzf {shlex.quote(path)} -C {shlex.quote(parent)}")
+        parent = path[: path.rfind("/")] if "/" in path else "/"
+        self._exec(
+            f"docker exec {self._container_id} tar -xzf {shlex.quote(path)} -C {shlex.quote(parent)}"
+        )
 
     def selected_paths(self, model, selection_model):
         return [
@@ -358,17 +426,32 @@ class SshDockerResourceBackend:
         tree.model().itemChanged.connect(on_item_changed)
         tree.edit(index)
 
-    def receive_paths(self, source_paths, target_path):
-        sftp = self._client.open_sftp()
+    def receive_paths(
+        self, source_paths, target_path, client=None, progress_callback=None
+    ):
+        c = client or self._client
+        sftp = c.open_sftp()
+        total = sum(Path(p).stat().st_size for p in source_paths)
+        uploaded = 0
         for local_path in source_paths:
             local_name = Path(local_path).name
             remote_target = f"{target_path}/{local_name}"
             ts = int(time.time())
             tmp = f"/tmp/porter_cp_{ts}"
-            sftp.put(local_path, tmp)
-            self._exec(
+            sftp.put(
+                local_path,
+                tmp,
+                callback=lambda x, y, base=uploaded: (
+                    progress_callback(base + x, total) if progress_callback else None
+                ),
+            )
+            uploaded += Path(local_path).stat().st_size
+            chan = c.get_transport().open_session()
+            chan.exec_command(
                 f"docker cp {shlex.quote(tmp)} {shlex.quote(self._container_id + ':' + remote_target)}"
             )
+            chan.recv_exit_status()
+            chan.close()
             sftp.remove(tmp)
         sftp.close()
 
@@ -388,7 +471,9 @@ class SshDockerResourceBackend:
         local = tmp / self.display_name(path)
         self.export_path(path, str(local))
         before = local.stat().st_size
-        subprocess.run(f'code --wait "{local}"', shell=True, capture_output=True, text=True)
+        subprocess.run(
+            f'code --wait "{local}"', shell=True, capture_output=True, text=True
+        )
         if local.stat().st_size != before:
             self.receive_paths([str(local)], self.parent_path(path))
         rmtree(tmp)

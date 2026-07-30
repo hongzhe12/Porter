@@ -1,9 +1,9 @@
 import sys
 from pathlib import Path
-from PySide6.QtGui import QIcon
+from PySide6.QtGui import QFont, QIcon
 import paramiko
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QThread, Signal
 from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMenu,
     QMessageBox,
+    QProgressBar,
     QPushButton,
     QTextEdit,
     QTreeView,
@@ -33,10 +34,39 @@ from backend import (
 )
 
 
+class UploadThread(QThread):
+    finished = Signal()
+    progress = Signal(int, int)
+
+    def __init__(self, backend, paths, target_path):
+        super().__init__()
+        self.backend = backend
+        self.paths = paths
+        self.target_path = target_path
+
+    def run(self):
+        client = paramiko.SSHClient()
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        client.connect(
+            self.backend._ssh_host,
+            port=self.backend._ssh_port,
+            username=self.backend._ssh_username,
+            password=self.backend._ssh_password,
+            timeout=5,
+        )
+        self.backend.receive_paths(
+            self.paths, self.target_path, client, self.progress.emit
+        )
+        client.close()
+        self.finished.emit()
+
+
 class ContainerTreeView(QTreeView):
     def __init__(self, owner: "ContainerPane"):
         super().__init__()
         self.owner = owner
+        self.setStyleSheet("QTreeView::item { height: 28px; }")
+        self.setFont(QFont("Microsoft YaHei", 12))
         self.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.setEditTriggers(
             QAbstractItemView.EditTrigger.EditKeyPressed
@@ -54,6 +84,7 @@ class ContainerTreeView(QTreeView):
                 menu.close()
                 QApplication.processEvents()
                 fn()
+
             return wrapper
 
         open_action = QAction("打开", self)
@@ -61,7 +92,9 @@ class ContainerTreeView(QTreeView):
         menu.addAction(open_action)
 
         rename_action = QAction("重命名", self)
-        rename_action.triggered.connect(before(lambda: self.owner.rename_selected(index)))
+        rename_action.triggered.connect(
+            before(lambda: self.owner.rename_selected(index))
+        )
         menu.addAction(rename_action)
 
         delete_action = QAction("删除", self)
@@ -114,6 +147,16 @@ class ContainerPane(QWidget):
 
         self._search_results = False
 
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setFixedHeight(10)
+        self.progress_bar.setStyleSheet(
+            """
+            QProgressBar { background: #e0e0e0; border-radius: 5px; text-align: center; color: #333; font: bold 8pt; }
+            QProgressBar::chunk { background: qlineargradient(x1:0,y1:0,x2:1,y2:0, stop:0 #4facfe, stop:1 #00f2fe); border-radius: 5px; }
+        """
+        )
+        self.progress_bar.setVisible(False)
+
         self.search_edit = QLineEdit()
         self.search_edit.setPlaceholderText("搜索文件...")
         self.search_btn = QPushButton("搜索")
@@ -141,6 +184,7 @@ class ContainerPane(QWidget):
         body.addLayout(header)
         body.addLayout(top_bar)
         body.addLayout(search_bar)
+        body.addWidget(self.progress_bar)
         body.addWidget(self.tree)
         self.setLayout(body)
 
@@ -151,8 +195,19 @@ class ContainerPane(QWidget):
     def dropEvent(self, event):
         paths = [u.toLocalFile() for u in event.mimeData().urls() if u.isLocalFile()]
         if paths:
-            self.backend.receive_paths(paths, self._current_path)
-            self.refresh()
+            self._upload_thread = UploadThread(self.backend, paths, self._current_path)
+            self._upload_thread.progress.connect(
+                lambda cur, tot: self.progress_bar.setValue(cur * 100 // tot)
+            )
+            self._upload_thread.finished.connect(self._upload_done)
+            self.progress_bar.setMaximum(100)
+            self.progress_bar.setValue(0)
+            self.progress_bar.setVisible(True)
+            self._upload_thread.start()
+
+    def _upload_done(self):
+        self.progress_bar.setVisible(False)
+        self.refresh()
 
     def open_path(self):
         path = self.path_edit.text().strip()
@@ -222,7 +277,9 @@ class ContainerPane(QWidget):
         keyword = self.search_edit.text().strip()
         if not keyword:
             return
-        self.backend.search_index(self.model, self.path_edit.text().strip() or "/", keyword)
+        self.backend.search_index(
+            self.model, self.path_edit.text().strip() or "/", keyword
+        )
         self._search_results = True
 
     def _extract_tar_selected(self):
@@ -232,10 +289,18 @@ class ContainerPane(QWidget):
         self.refresh()
 
     def _exec_command(self):
-        cmds = {"reload gunicorn": "pkill -HUP -o gunicorn",
-                "df -h": "df -h", "free -m": "free -m", "top -bn1": "top -bn1",
-                "ls -la /": "ls -la /", "ps aux": "ps aux", "uname -a": "uname -a"}
-        name, ok = QInputDialog.getItem(self, "执行命令", "选择或输入命令:", list(cmds), editable=True)
+        cmds = {
+            "reload gunicorn": "pkill -HUP -o gunicorn",
+            "df -h": "df -h",
+            "free -m": "free -m",
+            "top -bn1": "top -bn1",
+            "ls -la /": "ls -la /",
+            "ps aux": "ps aux",
+            "uname -a": "uname -a",
+        }
+        name, ok = QInputDialog.getItem(
+            self, "执行命令", "选择或输入命令:", list(cmds), editable=True
+        )
         if not ok or not name:
             return
         cmd = cmds.get(name, name)
@@ -267,12 +332,17 @@ class MainWindow(QMainWindow):
         tools.addAction("复制公钥命令", self._copy_public_key)
 
     def _copy_public_key(self):
-        for p in [Path.home() / ".ssh" / f"{k}.pub" for k in ["id_ed25519", "id_rsa", "id_ecdsa", "id_dsa"]]:
+        for p in [
+            Path.home() / ".ssh" / f"{k}.pub"
+            for k in ["id_ed25519", "id_rsa", "id_ecdsa", "id_dsa"]
+        ]:
             if p.exists():
                 key = p.read_text().strip()
                 cmd = f'echo "{key}" >> ~/.ssh/authorized_keys'
                 QApplication.clipboard().setText(cmd)
-                QMessageBox.information(self, "已复制", f"已从 {p.name} 生成命令并复制到剪贴板")
+                QMessageBox.information(
+                    self, "已复制", f"已从 {p.name} 生成命令并复制到剪贴板"
+                )
                 return
         QMessageBox.warning(self, "未找到公钥", "~/.ssh/id_*.pub 文件不存在")
 
@@ -310,7 +380,13 @@ class MainWindow(QMainWindow):
             ssh_username=ssh_info["username"],
             ssh_password=ssh_info["password"],
         )
-        save_session({**ssh_info, "container_id": ci["container_id"], "container_name": ci["container_name"]})
+        save_session(
+            {
+                **ssh_info,
+                "container_id": ci["container_id"],
+                "container_name": ci["container_name"],
+            }
+        )
         self._show_browser(backend)
 
     def _auto_restore(self):
@@ -320,7 +396,13 @@ class MainWindow(QMainWindow):
         try:
             client = paramiko.SSHClient()
             client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-            client.connect(s["host"], port=s["port"], username=s["username"], password=s["password"], timeout=5)
+            client.connect(
+                s["host"],
+                port=s["port"],
+                username=s["username"],
+                password=s["password"],
+                timeout=5,
+            )
         except Exception:
             return False
         if "container_id" in s:
@@ -358,5 +440,5 @@ def main():
 
 
 if __name__ == "__main__":
-    
+
     main()
