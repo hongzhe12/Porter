@@ -232,7 +232,7 @@ class ContainerPane(QWidget):
         self.refresh()
 
     def _exec_command(self):
-        cmds = {"重启gunicorn": "kill -HUP $(ps -C gunicorn -o pid | sed -n '2p' | xargs)",
+        cmds = {"reload gunicorn": "pkill -HUP -o gunicorn",
                 "df -h": "df -h", "free -m": "free -m", "top -bn1": "top -bn1",
                 "ls -la /": "ls -la /", "ps aux": "ps aux", "uname -a": "uname -a"}
         name, ok = QInputDialog.getItem(self, "执行命令", "选择或输入命令:", list(cmds), editable=True)
