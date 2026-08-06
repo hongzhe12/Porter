@@ -4,7 +4,6 @@ import shlex
 import subprocess
 import tempfile
 import time
-from datetime import datetime
 from pathlib import Path
 from shutil import rmtree
 
@@ -12,20 +11,6 @@ import paramiko
 
 from PySide6.QtCore import Qt, QModelIndex
 from PySide6.QtGui import QStandardItem, QStandardItemModel
-from PySide6.QtWidgets import (
-    QComboBox,
-    QDialog,
-    QDialogButtonBox,
-    QFormLayout,
-    QLabel,
-    QLineEdit,
-    QListWidget,
-    QListWidgetItem,
-    QMessageBox,
-    QPushButton,
-    QVBoxLayout,
-    QWidget,
-)
 
 SESSION_FILE = Path.home() / ".porter" / "session.json"
 
@@ -42,183 +27,23 @@ def load_session():
         return {}
 
 
-class SshConnectDialog(QDialog):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("SSH 连接")
-        layout = QFormLayout(self)
-
-        self.host_edit = QLineEdit()
-        self.port_edit = QLineEdit("22")
-        self.user_edit = QLineEdit()
-        self.pass_edit = QLineEdit()
-        self.pass_edit.setEchoMode(QLineEdit.EchoMode.Password)
-
-        layout.addRow("主机:", self.host_edit)
-        layout.addRow("端口:", self.port_edit)
-        layout.addRow("用户名:", self.user_edit)
-        layout.addRow("密码:", self.pass_edit)
-
-        buttons = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
-        )
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
-        layout.addRow(buttons)
-
-        s = load_session()
-        if s:
-            self.host_edit.setText(s.get("host", ""))
-            self.port_edit.setText(str(s.get("port", 22)))
-            self.user_edit.setText(s.get("username", ""))
-            self.pass_edit.setText(s.get("password", ""))
-
-    def connection_info(self):
-        return {
-            "host": self.host_edit.text().strip(),
-            "port": int(self.port_edit.text().strip()),
-            "username": self.user_edit.text().strip(),
-            "password": self.pass_edit.text(),
-        }
-
-
-class SearchableComboBox(QWidget):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self._items = []
-        self._selected_data = None
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-
-        self._edit = QLineEdit()
-        self._edit.setPlaceholderText("输入搜索...")
-        layout.addWidget(self._edit)
-
-        self._list = QListWidget()
-        self._list.setMaximumHeight(200)
-        self._edit.textChanged.connect(self._filter)
-        self._list.itemClicked.connect(self._select_item)
-        layout.addWidget(self._list)
-
-    def addItem(self, text, userData=None):
-        self._items.append((text, userData))
-        item = QListWidgetItem(text)
-        item.setData(Qt.ItemDataRole.UserRole, userData)
-        self._list.addItem(item)
-
-    def clear(self):
-        self._items.clear()
-        self._list.clear()
-        self._selected_data = None
-
-    def lineEdit(self):
-        return self._edit
-
-    def currentData(self):
-        return self._selected_data
-
-    def currentText(self):
-        return self._edit.text()
-
-    def count(self):
-        return self._list.count()
-
-    def _filter(self, text):
-        self._list.clear()
-        for display, data in self._items:
-            if not text or text.lower() in display.lower():
-                item = QListWidgetItem(display)
-                item.setData(Qt.ItemDataRole.UserRole, data)
-                self._list.addItem(item)
-        self._list.setVisible(True)
-
-    def _select_item(self, item):
-        self._edit.setText(item.text())
-        self._selected_data = item.data(Qt.ItemDataRole.UserRole)
-
-    def mousePressEvent(self, event):
-        super().mousePressEvent(event)
-        self._filter(self._edit.text())
-
-
-class ContainerSelectDialog(QDialog):
-    def __init__(self, parent, ssh_client, ssh_host=""):
-        super().__init__(parent)
-        self.setWindowTitle("选择 Docker 容器")
-        self._ssh = ssh_client
-        self._container_id = None
-        self._container_name = None
-
-        layout = QFormLayout(self)
-        if ssh_host:
-            layout.addRow(QLabel(f"通过 SSH {ssh_host} 连接到 Docker"))
-
-        self.container_combo = SearchableComboBox()
-        self.container_combo.lineEdit().setPlaceholderText(
-            "输入 ID/镜像名/容器名 搜索..."
-        )
-        layout.addRow("容器:", self.container_combo)
-
-        self.refresh_btn = QPushButton("刷新")
-        self.refresh_btn.clicked.connect(self._refresh)
-        layout.addRow("", self.refresh_btn)
-
-        buttons = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
-        )
-        buttons.accepted.connect(self._on_accept)
-        buttons.rejected.connect(self.reject)
-        layout.addRow(buttons)
-
-        self._refresh()
-
-    def _refresh(self):
-        self.container_combo.clear()
-        channel = self._ssh.get_transport().open_session()
-        try:
-            channel.exec_command("docker ps --format '{{.ID}}\t{{.Image}}\t{{.Names}}'")
-            stdout = channel.makefile("r", -1)
-            output = stdout.read()
-            exit_code = channel.recv_exit_status()
-            if exit_code != 0:
-                self.container_combo.addItem("Docker 未运行或不可用")
-                return
-        except Exception:
-            self.container_combo.addItem("无法获取容器列表")
-            return
-        finally:
-            channel.close()
-
-        text = output.decode("utf-8") if isinstance(output, bytes) else output
-        lines = [l.strip() for l in text.splitlines() if l.strip()]
-        if not lines:
-            self.container_combo.addItem("没有正在运行的容器")
-            return
-
-        for line in lines:
-            parts = line.split("\t", 2)
-            if len(parts) >= 2:
-                cid = parts[0]
-                cimage = parts[1]
-                cname = parts[2] if len(parts) > 2 else cid
-                display = f"{cid[:12]}  {cimage}  {cname}"
-                self.container_combo.addItem(display, (cid, cname))
-
-    def _on_accept(self):
-        data = self.container_combo.currentData()
-        if data is None:
-            QMessageBox.warning(self, "未选择容器", "请选择一个运行中的 Docker 容器")
-            return
-        self._container_id = data[0]
-        self._container_name = data[1]
-        self.accept()
-
-    @property
-    def container_info(self):
-        return {
-            "container_id": self._container_id,
-            "container_name": self._container_name,
-        }
+def list_containers(client):
+    channel = client.get_transport().open_session()
+    channel.exec_command("docker ps --format '{{.ID}}\t{{.Image}}\t{{.Names}}'")
+    output = channel.makefile("r", -1).read()
+    rc = channel.recv_exit_status()
+    channel.close()
+    if rc != 0:
+        return []
+    text = output.decode("utf-8") if isinstance(output, bytes) else output
+    result = []
+    for line in text.splitlines():
+        parts = line.strip().split("\t", 2)
+        if len(parts) >= 2:
+            result.append(
+                (parts[0], parts[1], parts[2] if len(parts) > 2 else parts[0])
+            )
+    return result
 
 
 class SshDockerResourceBackend:

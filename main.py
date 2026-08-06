@@ -1,321 +1,28 @@
 import sys
 from pathlib import Path
-from PySide6.QtGui import QFont, QIcon
+
 import paramiko
 
-from PySide6.QtCore import Qt, QThread, Signal
-from PySide6.QtGui import QAction
+from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import (
-    QAbstractItemView,
     QApplication,
     QDialog,
     QDialogButtonBox,
+    QFileDialog,
+    QFormLayout,
     QHBoxLayout,
-    QInputDialog,
     QLabel,
     QLineEdit,
     QMainWindow,
-    QMenu,
     QMessageBox,
-    QProgressBar,
     QPushButton,
     QTextEdit,
-    QTreeView,
     QVBoxLayout,
-    QWidget,
 )
 
-from backend import (
-    ContainerSelectDialog,
-    SshConnectDialog,
-    SshDockerResourceBackend,
-    load_session,
-    save_session,
-)
-
-
-class UploadThread(QThread):
-    finished = Signal()
-    progress = Signal(int, int)
-
-    def __init__(self, backend, paths, target_path):
-        super().__init__()
-        self.backend = backend
-        self.paths = paths
-        self.target_path = target_path
-
-    def run(self):
-        client = paramiko.SSHClient()
-        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        client.connect(
-            self.backend._ssh_host,
-            port=self.backend._ssh_port,
-            username=self.backend._ssh_username,
-            password=self.backend._ssh_password,
-            timeout=5,
-        )
-        self.backend.receive_paths(
-            self.paths, self.target_path, client, self.progress.emit
-        )
-        client.close()
-        self.finished.emit()
-
-
-class ContainerTreeView(QTreeView):
-    def __init__(self, owner: "ContainerPane"):
-        super().__init__()
-        self.owner = owner
-        self.setStyleSheet("QTreeView::item { height: 28px; }")
-        self.setFont(QFont("Microsoft YaHei", 12))
-        self.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
-        self.setEditTriggers(
-            QAbstractItemView.EditTrigger.EditKeyPressed
-            | QAbstractItemView.EditTrigger.SelectedClicked
-        )
-        self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
-        self.customContextMenuRequested.connect(self.show_context_menu)
-
-    def show_context_menu(self, position):
-        index = self.indexAt(position)
-        menu = QMenu(self)
-
-        def before(fn):
-            def wrapper():
-                menu.close()
-                QApplication.processEvents()
-                fn()
-
-            return wrapper
-
-        open_action = QAction("打开", self)
-        open_action.triggered.connect(before(lambda: self.owner.open_selected(index)))
-        menu.addAction(open_action)
-
-        rename_action = QAction("重命名", self)
-        rename_action.triggered.connect(
-            before(lambda: self.owner.rename_selected(index))
-        )
-        menu.addAction(rename_action)
-
-        delete_action = QAction("删除", self)
-        delete_action.triggered.connect(before(self.owner.delete_selected))
-        menu.addAction(delete_action)
-
-        copy_path_action = QAction("复制路径", self)
-        copy_path_action.triggered.connect(self.owner.copy_selected_path)
-        menu.addAction(copy_path_action)
-
-        extract_action = QAction("解压", self)
-        extract_action.triggered.connect(before(self.owner._extract_tar_selected))
-        menu.addAction(extract_action)
-
-        refresh_action = QAction("刷新", self)
-        refresh_action.triggered.connect(self.owner.refresh)
-        menu.addAction(refresh_action)
-
-        path = self.owner.path_from_index(index) if index.isValid() else ""
-        is_tar = path.endswith(".tar.gz") or path.endswith(".tgz")
-        if not index.isValid():
-            open_action.setEnabled(False)
-            rename_action.setEnabled(False)
-            delete_action.setEnabled(False)
-            copy_path_action.setEnabled(False)
-            extract_action.setEnabled(False)
-        else:
-            extract_action.setEnabled(is_tar)
-
-        menu.popup(self.viewport().mapToGlobal(position))
-
-
-class ContainerPane(QWidget):
-    def __init__(self, backend: SshDockerResourceBackend):
-        super().__init__()
-        self.backend = backend
-        self._current_path = backend.start_path()
-        self.model = backend.create_model(self)
-        self.setAcceptDrops(True)
-
-        self.type_label = QLabel(backend.resource_type())
-
-        self.path_edit = QLineEdit(self._current_path)
-        self.open_button = QPushButton("打开")
-        self.open_button.clicked.connect(self.open_path)
-
-        top_bar = QHBoxLayout()
-        top_bar.addWidget(self.path_edit)
-        top_bar.addWidget(self.open_button)
-
-        self._search_results = False
-
-        self.progress_bar = QProgressBar()
-        self.progress_bar.setFixedHeight(10)
-        self.progress_bar.setStyleSheet(
-            """
-            QProgressBar { background: #e0e0e0; border-radius: 5px; text-align: center; color: #333; font: bold 8pt; }
-            QProgressBar::chunk { background: qlineargradient(x1:0,y1:0,x2:1,y2:0, stop:0 #4facfe, stop:1 #00f2fe); border-radius: 5px; }
-        """
-        )
-        self.progress_bar.setVisible(False)
-
-        self.search_edit = QLineEdit()
-        self.search_edit.setPlaceholderText("搜索文件...")
-        self.search_btn = QPushButton("搜索")
-        self.search_btn.clicked.connect(self._search_files)
-        self.cmd_btn = QPushButton("命令")
-        self.cmd_btn.clicked.connect(self._exec_command)
-
-        search_bar = QHBoxLayout()
-        search_bar.addWidget(self.search_edit)
-        search_bar.addWidget(self.search_btn)
-        search_bar.addWidget(self.cmd_btn)
-
-        self.tree = ContainerTreeView(self)
-        self.tree.setModel(self.model)
-        self.tree.doubleClicked.connect(self.on_double_clicked)
-        self.tree.setSortingEnabled(True)
-        self.tree.sortByColumn(0, Qt.SortOrder.AscendingOrder)
-        self.set_current_path(self._current_path)
-
-        header = QHBoxLayout()
-        header.addStretch()
-        header.addWidget(self.type_label)
-
-        body = QVBoxLayout()
-        body.addLayout(header)
-        body.addLayout(top_bar)
-        body.addLayout(search_bar)
-        body.addWidget(self.progress_bar)
-        body.addWidget(self.tree)
-        self.setLayout(body)
-
-    def dragEnterEvent(self, event):
-        if event.mimeData().hasUrls():
-            event.acceptProposedAction()
-
-    def dropEvent(self, event):
-        paths = [u.toLocalFile() for u in event.mimeData().urls() if u.isLocalFile()]
-        if paths:
-            self._upload_thread = UploadThread(self.backend, paths, self._current_path)
-            self._upload_thread.progress.connect(
-                lambda cur, tot: self.progress_bar.setValue(cur * 100 // tot)
-            )
-            self._upload_thread.finished.connect(self._upload_done)
-            self.progress_bar.setMaximum(100)
-            self.progress_bar.setValue(0)
-            self.progress_bar.setVisible(True)
-            self._upload_thread.start()
-
-    def _upload_done(self):
-        self.progress_bar.setVisible(False)
-        self.refresh()
-
-    def open_path(self):
-        path = self.path_edit.text().strip()
-        if not path:
-            return
-        if not self.backend.path_exists(self.model, path):
-            QMessageBox.warning(self, "路径不存在", path)
-            return
-        self.set_current_path(path)
-
-    def on_double_clicked(self, index):
-        path = self.path_from_index(index)
-        if self._search_results:
-            self._search_results = False
-            self.set_current_path(self.backend.parent_path(path))
-            return
-        if self.is_dir(index):
-            self.set_current_path(path)
-            return
-        self.backend.open_path(path)
-
-    def set_current_path(self, path):
-        self._search_results = False
-        self._current_path = path
-        index = self.backend.index_for_path(self.model, path)
-        self.tree.setRootIndex(index)
-        self.path_edit.setText(path)
-
-    def path_from_index(self, index):
-        return self.backend.path_for_index(self.model, index)
-
-    def is_dir(self, index):
-        return self.backend.is_dir(self.model, index)
-
-    def selected_paths(self):
-        return self.backend.selected_paths(self.model, self.tree.selectionModel())
-
-    def open_selected(self, index):
-        if index.isValid():
-            self.on_double_clicked(index)
-
-    def rename_selected(self, index):
-        if index.isValid():
-            self.backend.begin_rename(self.tree, index)
-
-    def delete_selected(self):
-        selected = self.selected_paths()
-        if not selected:
-            return
-        names = "\n".join(self.backend.display_name(p) for p in selected)
-        if (
-            QMessageBox.question(self, "确认删除", f"确认删除以下项目？\n{names}")
-            == QMessageBox.StandardButton.Yes
-        ):
-            self.backend.delete_paths(selected)
-            self.refresh()
-
-    def copy_selected_path(self):
-        selected = self.selected_paths()
-        if selected:
-            QApplication.clipboard().setText("\n".join(selected))
-
-    def refresh(self):
-        self.set_current_path(self._current_path)
-
-    def _search_files(self):
-        keyword = self.search_edit.text().strip()
-        if not keyword:
-            return
-        self.backend.search_index(
-            self.model, self.path_edit.text().strip() or "/", keyword
-        )
-        self._search_results = True
-
-    def _extract_tar_selected(self):
-        selected = self.selected_paths()
-        for p in selected:
-            self.backend.extract_tar(p)
-        self.refresh()
-
-    def _exec_command(self):
-        cmds = {
-            "reload gunicorn": "pkill -HUP -o gunicorn",
-            "df -h": "df -h",
-            "free -m": "free -m",
-            "top -bn1": "top -bn1",
-            "ls -la /": "ls -la /",
-            "ps aux": "ps aux",
-            "uname -a": "uname -a",
-        }
-        name, ok = QInputDialog.getItem(
-            self, "执行命令", "选择或输入命令:", list(cmds), editable=True
-        )
-        if not ok or not name:
-            return
-        cmd = cmds.get(name, name)
-        rc, stdout = self.backend.run_command(cmd)
-        dlg = QDialog(self)
-        dlg.setWindowTitle(f"命令: {name}")
-        dlg.resize(700, 500)
-        dlg.setLayout(QVBoxLayout())
-        text = QTextEdit(stdout if stdout else f"(返回码: {rc}, 无输出)")
-        text.setReadOnly(True)
-        dlg.layout().addWidget(text)
-        btn = QDialogButtonBox(QDialogButtonBox.StandardButton.Close, parent=dlg)
-        btn.rejected.connect(dlg.accept)
-        dlg.layout().addWidget(btn)
-        dlg.exec()
+from backend import SshDockerResourceBackend, load_session, save_session
+from container_pane import ContainerPane
+from dialogs import BatchUploadDialog, ContainerSelectDialog, SshConnectDialog
 
 
 class MainWindow(QMainWindow):
@@ -330,6 +37,11 @@ class MainWindow(QMainWindow):
 
         tools = self.menuBar().addMenu("工具")
         tools.addAction("复制公钥命令", self._copy_public_key)
+        tools.addAction("上传文件", self._batch_upload)
+        tools.addAction("安装 VS Code Server...", self._install_vscode_server)
+
+    def _batch_upload(self):
+        BatchUploadDialog(self).exec()
 
     def _copy_public_key(self):
         for p in [
@@ -380,13 +92,32 @@ class MainWindow(QMainWindow):
             ssh_username=ssh_info["username"],
             ssh_password=ssh_info["password"],
         )
-        save_session(
+        s = load_session()
+        conns = s.get("connections", [])
+        conns = [
+            c
+            for c in conns
+            if not (
+                isinstance(c, dict)
+                and c.get("host") == ssh_info["host"]
+                and c.get("port") == ssh_info["port"]
+                and c.get("username") == ssh_info["username"]
+            )
+        ]
+        conns.insert(
+            0,
             {
-                **ssh_info,
-                "container_id": ci["container_id"],
-                "container_name": ci["container_name"],
-            }
+                "host": ssh_info["host"],
+                "port": ssh_info["port"],
+                "username": ssh_info["username"],
+                "password": ssh_info["password"],
+            },
         )
+        s["connections"] = conns[:10]
+        s.update(ssh_info)
+        s["container_id"] = ci["container_id"]
+        s["container_name"] = ci["container_name"]
+        save_session(s)
         self._show_browser(backend)
 
     def _auto_restore(self):
@@ -420,6 +151,114 @@ class MainWindow(QMainWindow):
         self._select_container(client, s)
         return True
 
+    def _install_vscode_server(self):
+        if not self.pane:
+            QMessageBox.warning(self, "未连接", "请先连接容器")
+            return
+
+        s = load_session()
+        vs = s.get("vscode_server", {})
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("安装 VS Code Server")
+        layout = QFormLayout(dlg)
+
+        home_edit = QLineEdit(vs.get("home", "/app"))
+        layout.addRow("HOME 路径:", home_edit)
+
+        commit_edit = QLineEdit(vs.get("commit", ""))
+        commit_edit.setPlaceholderText("fdb98833154679dbaa7af67a5a29fe19e55c2b73")
+        layout.addRow("Commit Hash:", commit_edit)
+
+        server_label = QLabel(Path(vs["server"]).name if vs.get("server") else "未选择")
+        server_btn = QPushButton("选择 server-linux-x64.tar.gz...")
+        server_path = [vs["server"]] if vs.get("server") else []
+
+        def pick_server():
+            f, _ = QFileDialog.getOpenFileName(dlg, "选择 vscode-server-linux-x64.tar.gz")
+            if f:
+                server_path.clear()
+                server_path.append(f)
+                server_label.setText(Path(f).name)
+
+        server_btn.clicked.connect(pick_server)
+        row = QHBoxLayout()
+        row.addWidget(server_label)
+        row.addWidget(server_btn)
+        layout.addRow("Server:", row)
+
+        cli_label = QLabel(Path(vs["cli"]).name if vs.get("cli") else "未选择 (可选)")
+        cli_btn = QPushButton("选择 CLI tar.gz...")
+        cli_path = [vs["cli"]] if vs.get("cli") else []
+
+        def pick_cli():
+            f, _ = QFileDialog.getOpenFileName(dlg, "选择 CLI tar.gz")
+            if f:
+                cli_path.clear()
+                cli_path.append(f)
+                cli_label.setText(Path(f).name)
+
+        cli_btn.clicked.connect(pick_cli)
+        row2 = QHBoxLayout()
+        row2.addWidget(cli_label)
+        row2.addWidget(cli_btn)
+        layout.addRow("CLI:", row2)
+
+        btns = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        btns.accepted.connect(dlg.accept)
+        btns.rejected.connect(dlg.reject)
+        layout.addRow(btns)
+
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        home = home_edit.text().strip()
+        commit = commit_edit.text().strip() or "fdb98833154679dbaa7af67a5a29fe19e55c2b73"
+
+        s["vscode_server"] = {
+            "home": home,
+            "commit": commit_edit.text().strip(),
+        }
+        if server_path:
+            s["vscode_server"]["server"] = server_path[0]
+        if cli_path:
+            s["vscode_server"]["cli"] = cli_path[0]
+        save_session(s)
+        backend = self.pane.backend
+
+        if server_path:
+            backend.receive_paths(server_path, "/tmp")
+        if cli_path:
+            backend.receive_paths(cli_path, "/tmp")
+
+        cmds = f"""export HOME={home}
+mkdir -p $HOME/.vscode-server
+"""
+        if cli_path:
+            cli_name = Path(cli_path[0]).name
+            cmds += f"cp /tmp/{cli_name} $HOME/.vscode-server/vscode-cli-{commit}.tar.gz.done\n"
+
+        if server_path:
+            server_name = Path(server_path[0]).name
+            cmds += f"mkdir -p $HOME/.vscode-server/cli/servers/Stable-{commit}/server\n"
+            cmds += f"tar -xvzf /tmp/{server_name} --strip-components 1 -C $HOME/.vscode-server/cli/servers/Stable-{commit}/server\n"
+
+        cmds += f"mkdir -p $HOME/.vscode-server/bin\n"
+        cmds += f"ln -sf $HOME/.vscode-server/cli/servers/Stable-{commit}/server $HOME/.vscode-server/bin/{commit}\n"
+
+        rc, stdout = backend.run_command(cmds, timeout=120)
+
+        result = QDialog(self)
+        result.setWindowTitle("安装结果")
+        result.resize(600, 400)
+        rl = QVBoxLayout(result)
+        text = QTextEdit(stdout or f"返回码: {rc}")
+        text.setReadOnly(True)
+        rl.addWidget(text)
+        result.exec()
+
     def _show_browser(self, backend):
         if self.pane:
             self.pane.deleteLater()
@@ -430,7 +269,6 @@ class MainWindow(QMainWindow):
 def main():
     app = QApplication(sys.argv)
     window = MainWindow()
-    # 判断是否为windows系统，如果是则设置窗口图标为icon.ico
     if sys.platform.startswith("win"):
         window.setWindowIcon(QIcon("icon.ico"))
     window.show()
@@ -440,5 +278,4 @@ def main():
 
 
 if __name__ == "__main__":
-
     main()
